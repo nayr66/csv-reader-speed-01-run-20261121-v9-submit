@@ -985,3 +985,714 @@ pub extern "C" fn parse_nojson(len_units: u32, header: u32) -> u32 {
     p.run();
     p.nfields as u32
 }
+
+// ---------------------------------------------------------------- fused path
+// Single-pass fused transducer: scan + field extraction + JSON write in ONE
+// pass over the input. No POOL / FIELDS / ROWS arrays: field JSON is written
+// straight from the input spans into OUT, errors stay in the small binary
+// ERRORS buffer, long-row extra fields go to the EXTRA scratch (JSON text).
+// If EXTRA runs low, parse_fused_at returns FUSED_OVERFLOW and the driver
+// falls back to the two-phase parse_at (whose regions are kept intact).
+// The old parse/parse_at exports stay untouched (verified path + fallback).
+
+const EXTRA_CAP_BYTES: usize = 1_048_576;
+const EXTRA_RESERVE_BYTES: usize = 16_384; // refuse a new extra field below this
+const FUSED_OVERFLOW: u32 = u32::MAX;
+
+static mut EXTRA_MEM: [u8; EXTRA_CAP_BYTES] = [0; EXTRA_CAP_BYTES];
+
+#[inline(always)]
+fn wbyte(dst: *mut u8, b: u8) -> *mut u8 {
+    unsafe {
+        *dst = b;
+        dst.add(1)
+    }
+}
+
+#[inline(always)]
+fn wbytes(dst: *mut u8, s: &[u8]) -> *mut u8 {
+    unsafe {
+        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+        dst.add(s.len())
+    }
+}
+
+#[inline(always)]
+fn wu32(dst: *mut u8, mut v: u32) -> *mut u8 {
+    if v == 0 {
+        return wbyte(dst, b'0');
+    }
+    let mut buf = [0u8; 10];
+    let mut i = 10;
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    wbytes(dst, &buf[i..])
+}
+
+struct F {
+    len: usize,
+    pos: usize,
+    line: u32,
+    record_line: u32,
+    record_row: i32,
+    width: i32,
+    header: bool,
+    columns_done: bool,
+    nrows: usize,
+    nerrors: usize,
+    out: *mut u8,
+    out_base: *mut u8,
+    xout: *mut u8,
+    xbase: *mut u8,
+    extra_overflow: bool,
+    sp_comma: v128,
+    sp_quote: v128,
+    sp_lf: v128,
+    sp_cr: v128,
+    sp_bs: v128,
+    sp_ctrl: v128,
+    sp_hi: v128,
+    sp_zero: v128,
+}
+
+impl F {
+    #[inline(always)]
+    fn inp(&self, i: usize) -> u16 {
+        unsafe { *in_ptr().add(i) }
+    }
+    #[inline(always)]
+    fn push_error(&mut self, code: u8, payload: u32, payload2: u32) {
+        if self.nerrors >= MAX_ERRORS {
+            return;
+        }
+        unsafe {
+            *errors_ptr().add(self.nerrors) = Error {
+                code,
+                line: self.record_line,
+                row: self.record_row,
+                payload,
+                payload2,
+            };
+        }
+        self.nerrors += 1;
+    }
+
+    // First of {comma, LF, CR} at or after `from`. (Same as P::scan3.)
+    #[inline(always)]
+    fn scan3(&self, from: usize) -> (usize, u8) {
+        let base = in_ptr();
+        let mut i = from;
+        while i + 8 <= self.len {
+            let v = unsafe { v128_load(base.add(i) as *const v128) };
+            let m = v128_or(
+                v128_or(u16x8_eq(v, self.sp_comma), u16x8_eq(v, self.sp_lf)),
+                u16x8_eq(v, self.sp_cr),
+            );
+            let bits = u16x8_bitmask(m);
+            if bits != 0 {
+                let lane = bits.trailing_zeros() as usize;
+                let bit = 1u8 << lane;
+                let p = i + lane;
+                if (u16x8_bitmask(u16x8_eq(v, self.sp_comma)) & bit) != 0 {
+                    return (p, K_COMMA);
+                }
+                if (u16x8_bitmask(u16x8_eq(v, self.sp_lf)) & bit) != 0 {
+                    return (p, K_LF);
+                }
+                return (p, K_CR);
+            }
+            i += 8;
+        }
+        while i < self.len {
+            let u = self.inp(i);
+            if u == COMMA {
+                return (i, K_COMMA);
+            }
+            if u == LF {
+                return (i, K_LF);
+            }
+            if u == CR {
+                return (i, K_CR);
+            }
+            i += 1;
+        }
+        (self.len, K_END)
+    }
+
+    // First quote at or after `from`, counting LFs and noting any CR in the
+    // units scanned before it. (Same as P::scan_quote.)
+    #[inline(always)]
+    fn scan_quote(&self, from: usize) -> (usize, u8, u32, bool) {
+        let base = in_ptr();
+        let mut i = from;
+        let mut lf: u32 = 0;
+        let mut has_cr = false;
+        while i + 8 <= self.len {
+            let v = unsafe { v128_load(base.add(i) as *const v128) };
+            let qm = u16x8_eq(v, self.sp_quote);
+            let qbits = u16x8_bitmask(qm);
+            if qbits != 0 {
+                let lane = qbits.trailing_zeros() as usize;
+                let before = (1u16 << lane) - 1;
+                lf += (u16x8_bitmask(u16x8_eq(v, self.sp_lf)) & (before as u8))
+                    .count_ones();
+                has_cr = has_cr
+                    || (u16x8_bitmask(u16x8_eq(v, self.sp_cr)) & (before as u8)) != 0;
+                return (i + lane, K_QUOTE, lf, has_cr);
+            }
+            lf += u16x8_bitmask(u16x8_eq(v, self.sp_lf)).count_ones();
+            has_cr = has_cr || u16x8_bitmask(u16x8_eq(v, self.sp_cr)) != 0;
+            i += 8;
+        }
+        while i < self.len {
+            let u = self.inp(i);
+            if u == QUOTE {
+                return (i, K_QUOTE, lf, has_cr);
+            }
+            if u == LF {
+                lf += 1;
+            } else if u == CR {
+                has_cr = true;
+            }
+            i += 1;
+        }
+        (self.len, K_END, lf, has_cr)
+    }
+
+    // Escape one UTF-16 unit as JSON string content (no surrounding quotes).
+    // `next`/`has_next` are the following unit for surrogate pairs.
+    // Returns (dst, units_consumed).
+    #[inline(always)]
+    fn write_unit_json(
+        &self,
+        mut dst: *mut u8,
+        u: u16,
+        next: u16,
+        has_next: bool,
+    ) -> (*mut u8, usize) {
+        let h = b"0123456789abcdef";
+        if u < 0x20 {
+            dst = wbytes(dst, b"\\u00");
+            dst = wbyte(dst, h[(u >> 4) as usize]);
+            dst = wbyte(dst, h[(u & 0xF) as usize]);
+            (dst, 1)
+        } else if u == QUOTE {
+            dst = wbytes(dst, b"\\\"");
+            (dst, 1)
+        } else if u == BACKSLASH {
+            dst = wbytes(dst, b"\\\\");
+            (dst, 1)
+        } else if u < 0x80 {
+            dst = wbyte(dst, u as u8);
+            (dst, 1)
+        } else if (0xD800..0xDC00).contains(&u) {
+            if has_next && (0xDC00..0xE000).contains(&next) {
+                let cp: u32 =
+                    0x10000 + (((u as u32) - 0xD800) << 10) + ((next as u32) - 0xDC00);
+                dst = wbyte(dst, (0xF0 | (cp >> 18)) as u8);
+                dst = wbyte(dst, (0x80 | ((cp >> 12) & 0x3F)) as u8);
+                dst = wbyte(dst, (0x80 | ((cp >> 6) & 0x3F)) as u8);
+                dst = wbyte(dst, (0x80 | (cp & 0x3F)) as u8);
+                (dst, 2)
+            } else {
+                dst = wbytes(dst, b"\\u");
+                dst = wbyte(dst, h[((u >> 12) & 0xF) as usize]);
+                dst = wbyte(dst, h[((u >> 8) & 0xF) as usize]);
+                dst = wbyte(dst, h[((u >> 4) & 0xF) as usize]);
+                dst = wbyte(dst, h[(u & 0xF) as usize]);
+                (dst, 1)
+            }
+        } else if (0xDC00..0xE000).contains(&u) {
+            dst = wbytes(dst, b"\\u");
+            dst = wbyte(dst, h[((u >> 12) & 0xF) as usize]);
+            dst = wbyte(dst, h[((u >> 8) & 0xF) as usize]);
+            dst = wbyte(dst, h[((u >> 4) & 0xF) as usize]);
+            dst = wbyte(dst, h[(u & 0xF) as usize]);
+            (dst, 1)
+        } else if u < 0x800 {
+            dst = wbyte(dst, (0xC0 | (u >> 6)) as u8);
+            dst = wbyte(dst, (0x80 | (u & 0x3F)) as u8);
+            (dst, 1)
+        } else {
+            dst = wbyte(dst, (0xE0 | (u >> 12)) as u8);
+            dst = wbyte(dst, (0x80 | ((u >> 6) & 0x3F)) as u8);
+            dst = wbyte(dst, (0x80 | (u & 0x3F)) as u8);
+            (dst, 1)
+        }
+    }
+
+    // Write input[start..end] as JSON string content (no surrounding quotes).
+    // SIMD bulk for clean ASCII runs, scalar tail for the rest. (Same
+    // escaping as P::write_json_string, but over input spans, into `dst`.)
+    #[inline(always)]
+    fn write_span_json(&self, mut dst: *mut u8, start: usize, end: usize) -> *mut u8 {
+        let base = in_ptr();
+        let len = end - start;
+        let mut i = 0usize;
+        while i + 16 <= len {
+            let v0 = unsafe { v128_load(base.add(start + i) as *const v128) };
+            let v1 = unsafe { v128_load(base.add(start + i + 8) as *const v128) };
+            let bad0 = v128_or(
+                v128_or(u16x8_eq(v0, self.sp_quote), u16x8_eq(v0, self.sp_bs)),
+                v128_or(u16x8_lt(v0, self.sp_ctrl), u16x8_ge(v0, self.sp_hi)),
+            );
+            let bad1 = v128_or(
+                v128_or(u16x8_eq(v1, self.sp_quote), u16x8_eq(v1, self.sp_bs)),
+                v128_or(u16x8_lt(v1, self.sp_ctrl), u16x8_ge(v1, self.sp_hi)),
+            );
+            if u16x8_bitmask(bad0) | u16x8_bitmask(bad1) != 0 {
+                break;
+            }
+            let packed = i8x16_narrow_i16x8(v0, v1);
+            unsafe {
+                v128_store(dst as *mut v128, packed);
+                dst = dst.add(16);
+            }
+            i += 16;
+        }
+        if i + 8 <= len {
+            let v = unsafe { v128_load(base.add(start + i) as *const v128) };
+            let bad = v128_or(
+                v128_or(u16x8_eq(v, self.sp_quote), u16x8_eq(v, self.sp_bs)),
+                v128_or(u16x8_lt(v, self.sp_ctrl), u16x8_ge(v, self.sp_hi)),
+            );
+            if u16x8_bitmask(bad) == 0 {
+                let packed = i8x16_narrow_i16x8(v, self.sp_zero);
+                let low = i64x2_extract_lane::<0>(packed) as u64;
+                unsafe {
+                    *(dst as *mut u64) = low;
+                    dst = dst.add(8);
+                }
+                i += 8;
+            }
+        }
+        while i < len {
+            let u = unsafe { *base.add(start + i) };
+            let next = if i + 1 < len {
+                unsafe { *base.add(start + i + 1) }
+            } else {
+                0
+            };
+            let (d2, adv) = self.write_unit_json(dst, u, next, i + 1 < len);
+            dst = d2;
+            i += adv;
+        }
+        dst
+    }
+
+    // Write a quoted span's raw content with "" -> " and CRLF / lone CR ->
+    // LF collapsing, JSON-escaped. Returns (dst, line breaks in the span).
+    fn write_span_collapse(
+        &self,
+        mut dst: *mut u8,
+        start: usize,
+        end: usize,
+    ) -> (*mut u8, u32) {
+        let base = in_ptr();
+        let mut breaks: u32 = 0;
+        let mut i = start;
+        while i < end {
+            let u = unsafe { *base.add(i) };
+            if u == QUOTE {
+                // Inside the span every quote is a doubled pair (the scan
+                // only stops at a quote not followed by another quote).
+                dst = wbytes(dst, b"\\\"");
+                i += if i + 1 < end && unsafe { *base.add(i + 1) } == QUOTE {
+                    2
+                } else {
+                    1
+                };
+            } else if u == CR {
+                dst = wbytes(dst, b"\\u000a");
+                breaks += 1;
+                i += if i + 1 < end && unsafe { *base.add(i + 1) } == LF {
+                    2
+                } else {
+                    1
+                };
+            } else if u == LF {
+                dst = wbytes(dst, b"\\u000a");
+                breaks += 1;
+                i += 1;
+            } else {
+                let next = if i + 1 < end {
+                    unsafe { *base.add(i + 1) }
+                } else {
+                    0
+                };
+                let (d2, adv) = self.write_unit_json(dst, u, next, i + 1 < end);
+                dst = d2;
+                i += adv;
+            }
+        }
+        (dst, breaks)
+    }
+
+    // Reads unquoted characters as the current field's content (already
+    // inside the JSON string quotes), up to the next comma or line break.
+    // A CR not followed by LF is dropped (stray_cr). A quote is literal.
+    #[inline(always)]
+    fn read_unquoted(&mut self, mut dst: *mut u8) -> (*mut u8, u8) {
+        loop {
+            let (dpos, kind) = self.scan3(self.pos);
+            match kind {
+                K_COMMA => {
+                    dst = self.write_span_json(dst, self.pos, dpos);
+                    self.pos = dpos + 1;
+                    return (dst, FE_COMMA);
+                }
+                K_LF => {
+                    dst = self.write_span_json(dst, self.pos, dpos);
+                    self.pos = dpos + 1;
+                    self.line += 1;
+                    return (dst, FE_LB);
+                }
+                K_CR => {
+                    if dpos + 1 < self.len && self.inp(dpos + 1) == LF {
+                        dst = self.write_span_json(dst, self.pos, dpos);
+                        self.pos = dpos + 2;
+                        self.line += 1;
+                        return (dst, FE_LB);
+                    }
+                    self.push_error(E_STRAY_CR, 0, 0);
+                    dst = self.write_span_json(dst, self.pos, dpos);
+                    self.pos = dpos + 1;
+                }
+                _ => {
+                    dst = self.write_span_json(dst, self.pos, self.len);
+                    self.pos = self.len;
+                    return (dst, FE_END);
+                }
+            }
+        }
+    }
+
+    // Reads a quoted field whose opening quote is at pos, as the current
+    // field's content (already inside the JSON string quotes).
+    #[inline(always)]
+    fn read_quoted(&mut self, mut dst: *mut u8) -> (*mut u8, u8) {
+        let open = self.pos;
+        let open_line = self.line;
+        self.pos += 1;
+        let mut has_doubled = false;
+        let q: usize;
+        let mut scan = self.pos;
+        let mut span_lf: u32 = 0;
+        let mut span_has_cr = false;
+        loop {
+            let (p, k, lf, has_cr) = self.scan_quote(scan);
+            span_lf += lf;
+            span_has_cr = span_has_cr || has_cr;
+            if k == K_END {
+                // The quote never closes: literal character, text after it
+                // read again as unquoted.
+                self.pos = open + 1;
+                self.line = open_line;
+                self.push_error(E_UNTERMINATED, 0, 0);
+                dst = wbytes(dst, b"\\\"");
+                return self.read_unquoted(dst);
+            }
+            if p + 1 < self.len && self.inp(p + 1) == QUOTE {
+                has_doubled = true;
+                scan = p + 2;
+                continue;
+            }
+            q = p;
+            break;
+        }
+        let span_start = self.pos;
+        let span_end = q;
+        if has_doubled || span_has_cr {
+            let (d2, breaks) = self.write_span_collapse(dst, span_start, span_end);
+            dst = d2;
+            self.line += breaks;
+        } else {
+            dst = self.write_span_json(dst, span_start, span_end);
+            self.line += span_lf;
+        }
+        self.pos = q + 1;
+        if self.pos >= self.len {
+            return (dst, FE_END);
+        }
+        let c = self.inp(self.pos);
+        if c == COMMA {
+            self.pos += 1;
+            return (dst, FE_COMMA);
+        }
+        if c == LF {
+            self.pos += 1;
+            self.line += 1;
+            return (dst, FE_LB);
+        }
+        if c == CR && self.pos + 1 < self.len && self.inp(self.pos + 1) == LF {
+            self.pos += 2;
+            self.line += 1;
+            return (dst, FE_LB);
+        }
+        // What follows the closing quote is appended as it stands.
+        let before = dst;
+        let (d2, fe) = self.read_unquoted(dst);
+        dst = d2;
+        if dst != before {
+            self.push_error(E_QUOTE_JUNK, 0, 0);
+        }
+        (dst, fe)
+    }
+
+    // Parses one record and writes its JSON array. `is_columns` means this
+    // record is the header's columns (header && !columns_done). Returns
+    // true iff the record is real (a line left with no characters is no
+    // record; its stray_cr errors stay, OUT/EXTRA are rewound).
+    fn parse_record(&mut self, is_columns: bool) -> bool {
+        self.record_line = self.line;
+        self.record_row = if is_columns {
+            -1
+        } else {
+            self.nrows as i32
+        };
+        let mark = self.out;
+        let xmark = self.xout;
+        if is_columns {
+            self.out = wbyte(self.out, b'[');
+        } else {
+            if self.nrows > 0 {
+                self.out = wbyte(self.out, b',');
+            }
+            self.out = wbyte(self.out, b'[');
+        }
+        let mut k = 0usize;
+        let mut first_quoted = false;
+        let mut first_len = 0usize;
+        let mut extra_count = 0usize;
+        let mut extra_start = self.xout;
+        let mut fe: u8 = FE_END;
+        loop {
+            let quoted = self.inp(self.pos) == QUOTE;
+            if k == 0 {
+                first_quoted = quoted;
+            }
+            let is_extra = !is_columns && self.width >= 0 && (k as i32) >= self.width;
+            if is_extra
+                && (self.xout as usize) - (self.xbase as usize)
+                    > EXTRA_CAP_BYTES - EXTRA_RESERVE_BYTES
+            {
+                self.extra_overflow = true;
+                return false;
+            }
+            let mut dst: *mut u8;
+            if is_extra {
+                if extra_count == 0 {
+                    extra_start = self.xout;
+                }
+                dst = self.xout;
+                if extra_count > 0 {
+                    dst = wbyte(dst, b',');
+                }
+            } else {
+                dst = self.out;
+                if k > 0 {
+                    dst = wbyte(dst, b',');
+                }
+            }
+            let content_start = dst;
+            dst = wbyte(dst, b'"');
+            let (d2, f) = if quoted {
+                self.read_quoted(dst)
+            } else {
+                self.read_unquoted(dst)
+            };
+            dst = d2;
+            dst = wbyte(dst, b'"');
+            if k == 0 {
+                first_len = (dst as usize) - (content_start as usize) - 2;
+            }
+            if is_extra {
+                self.xout = dst;
+                extra_count += 1;
+            } else {
+                self.out = dst;
+            }
+            fe = f;
+            k += 1;
+            if fe != FE_COMMA {
+                break;
+            }
+        }
+        if k == 1 && !first_quoted && first_len == 0 {
+            self.out = mark;
+            self.xout = xmark;
+            return false;
+        }
+        if is_columns {
+            if self.width < 0 {
+                self.width = k as i32;
+            }
+            self.out = wbyte(self.out, b']');
+            self.columns_done = true;
+            return true;
+        }
+        if self.width < 0 {
+            self.width = k as i32;
+            self.out = wbyte(self.out, b']');
+            self.nrows += 1;
+            return true;
+        }
+        let w = self.width as usize;
+        if k < w {
+            self.push_error(E_SHORT_ROW, k as u32, 0);
+            for _ in k..w {
+                self.out = wbytes(self.out, b",\"\"");
+            }
+            self.out = wbyte(self.out, b']');
+        } else if k > w {
+            let xlen = (self.xout as usize) - (extra_start as usize);
+            self.push_error(
+                E_LONG_ROW,
+                (extra_start as usize - self.xbase as usize) as u32,
+                xlen as u32,
+            );
+            self.out = wbyte(self.out, b']');
+        } else {
+            self.out = wbyte(self.out, b']');
+        }
+        self.nrows += 1;
+        true
+    }
+
+    // Skips lines left with no characters (LF / CRLF only).
+    #[inline(always)]
+    fn skip_empty_lines(&mut self) {
+        while self.pos < self.len {
+            let u = self.inp(self.pos);
+            if u == LF {
+                self.pos += 1;
+                self.line += 1;
+            } else if u == CR && self.pos + 1 < self.len && self.inp(self.pos + 1) == LF {
+                self.pos += 2;
+                self.line += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn run_fused(&mut self) {
+        if self.len > 0 && self.inp(0) == BOM {
+            self.pos = 1;
+        }
+        if self.header {
+            self.out = wbytes(self.out, b"{\"columns\":");
+            loop {
+                self.skip_empty_lines();
+                if self.pos >= self.len {
+                    break;
+                }
+                if self.parse_record(true) {
+                    break;
+                }
+                if self.extra_overflow {
+                    return;
+                }
+            }
+            if !self.columns_done {
+                self.out = wbytes(self.out, b"[]");
+            }
+            self.out = wbytes(self.out, b",\"rows\":[");
+        } else {
+            self.out = wbytes(self.out, b"{\"columns\":null,\"rows\":[");
+        }
+        loop {
+            self.skip_empty_lines();
+            if self.pos >= self.len {
+                break;
+            }
+            self.parse_record(false);
+            if self.extra_overflow {
+                return;
+            }
+        }
+        self.out = wbytes(self.out, b"],\"errors\":[");
+        for e in 0..self.nerrors {
+            if e > 0 {
+                self.out = wbyte(self.out, b',');
+            }
+            let err = unsafe { *errors_ptr_const().add(e) };
+            self.out = wbytes(self.out, b"{\"code\":\"");
+            self.out = wbytes(self.out, CODE_NAMES[err.code as usize].as_bytes());
+            self.out = wbytes(self.out, b"\",\"line\":");
+            self.out = wu32(self.out, err.line);
+            self.out = wbytes(self.out, b",\"row\":");
+            if err.row < 0 {
+                self.out = wbytes(self.out, b"null");
+            } else {
+                self.out = wu32(self.out, err.row as u32);
+            }
+            match err.code {
+                E_SHORT_ROW => {
+                    self.out = wbytes(self.out, b",\"fields\":");
+                    self.out = wu32(self.out, err.payload);
+                }
+                E_LONG_ROW => {
+                    self.out = wbytes(self.out, b",\"extra\":[");
+                    let xs = unsafe { EXTRA_MEM.as_ptr().add(err.payload as usize) };
+                    let xn = err.payload2 as usize;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(xs, self.out, xn);
+                        self.out = self.out.add(xn);
+                    }
+                    self.out = wbyte(self.out, b']');
+                }
+                _ => {}
+            }
+            self.out = wbyte(self.out, b'}');
+        }
+        self.out = wbytes(self.out, b"]}");
+    }
+}
+
+fn new_fused(len_units: usize, header: bool, out_off: usize) -> F {
+    let out_base = unsafe { MEM.as_mut_ptr().add(OUT_OFF + out_off) };
+    let xbase = unsafe { EXTRA_MEM.as_mut_ptr() };
+    F {
+        len: len_units,
+        pos: 0,
+        line: 1,
+        record_line: 1,
+        record_row: -1,
+        width: -1,
+        header,
+        columns_done: false,
+        nrows: 0,
+        nerrors: 0,
+        out: out_base,
+        out_base,
+        xout: xbase,
+        xbase,
+        extra_overflow: false,
+        sp_comma: u16x8_splat(COMMA),
+        sp_quote: u16x8_splat(QUOTE),
+        sp_lf: u16x8_splat(LF),
+        sp_cr: u16x8_splat(CR),
+        sp_bs: u16x8_splat(BACKSLASH),
+        sp_ctrl: u16x8_splat(0x20),
+        sp_hi: u16x8_splat(0x80),
+        sp_zero: u16x8_splat(0),
+    }
+}
+
+/// Fused single-pass parse: writes the JSON answer at OUT + out_off (bytes);
+/// returns its length, or FUSED_OVERFLOW (u32::MAX) if the EXTRA scratch ran
+/// low (driver falls back to parse_at). Bytes stay valid until the next
+/// parse call.
+#[no_mangle]
+pub extern "C" fn parse_fused_at(len_units: u32, header: u32, out_off: u32) -> u32 {
+    let mut f = new_fused(len_units as usize, header != 0, out_off as usize);
+    f.run_fused();
+    if f.extra_overflow {
+        return FUSED_OVERFLOW;
+    }
+    (f.out as usize - f.out_base as usize) as u32
+}
